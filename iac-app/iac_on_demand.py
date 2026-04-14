@@ -2,7 +2,28 @@ import os
 import subprocess
 from openai import OpenAI
 
+# 🔥 FastAPI imports
+from fastapi import FastAPI
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# 🔥 FastAPI app
+app = FastAPI()
+
+# Enable CORS (for GitHub frontend)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# 🔹 Request model
+class RequestModel(BaseModel):
+    input: str
 
 
 def generate_iac(user_input: str):
@@ -48,9 +69,6 @@ DIAGRAM RULES
 ========================
 - Generate a Mermaid diagram using "graph TD"
 - Show main AWS components and relationships
-- Keep it clean and readable
-- Use labels like:
-  User --> API Gateway --> Lambda --> EC2
 
 ========================
 OUTPUT FORMAT STRICTLY
@@ -64,10 +82,6 @@ OUTPUT FORMAT STRICTLY
 
 ---DIAGRAM---
 <MERMAID CODE ONLY>
-
-IMPORTANT:
-- No explanations outside sections
-- No markdown formatting
 """
 
     response = client.responses.create(
@@ -82,15 +96,18 @@ IMPORTANT:
 
 
 def split_output(output: str):
-    cf, tf = "", ""
+    cf, tf, diagram = "", "", ""
 
     if "---CLOUDFORMATION---" in output:
         cf = output.split("---CLOUDFORMATION---")[1].split("---TERRAFORM---")[0].strip()
 
     if "---TERRAFORM---" in output:
-        tf = output.split("---TERRAFORM---")[1].strip()
+        tf = output.split("---TERRAFORM---")[1].split("---DIAGRAM---")[0].strip()
 
-    return cf, tf
+    if "---DIAGRAM---" in output:
+        diagram = output.split("---DIAGRAM---")[1].strip()
+
+    return cf, tf, diagram
 
 
 def save_files(cf_code, tf_code):
@@ -106,28 +123,18 @@ def save_files(cf_code, tf_code):
 # 🔥 VALIDATION FUNCTIONS
 
 def validate_cloudformation():
-    print("\n🔍 Validating CloudFormation...")
-
     try:
         result = subprocess.run(
             ["aws", "cloudformation", "validate-template", "--template-body", "file://template.yaml"],
             capture_output=True,
             text=True
         )
-
-        if result.returncode == 0:
-            print("✅ CloudFormation is VALID")
-        else:
-            print("❌ CloudFormation INVALID")
-            print(result.stderr)
-
+        return result.returncode == 0, result.stderr
     except Exception as e:
-        print("Error:", str(e))
+        return False, str(e)
 
 
 def validate_terraform():
-    print("\n🔍 Validating Terraform...")
-
     try:
         subprocess.run(["terraform", "init"], capture_output=True, text=True)
 
@@ -136,32 +143,62 @@ def validate_terraform():
             capture_output=True,
             text=True
         )
-
-        if result.returncode == 0:
-            print("✅ Terraform is VALID")
-        else:
-            print("❌ Terraform INVALID")
-            print(result.stderr)
-
+        return result.returncode == 0, result.stderr
     except Exception as e:
-        print("Error:", str(e))
+        return False, str(e)
 
 
+# 🚀 FASTAPI ENDPOINT
+@app.post("/generate")
+def generate(request: RequestModel):
+    raw = generate_iac(request.input)
+    cf, tf, diagram = split_output(raw)
+
+    save_files(cf, tf)
+
+    cf_valid, cf_err = validate_cloudformation() if cf else (False, "")
+    tf_valid, tf_err = validate_terraform() if tf else (False, "")
+
+    return {
+        "cloudformation": cf,
+        "terraform": tf,
+        "diagram": diagram,
+        "validation": {
+            "cloudformation_valid": cf_valid,
+            "cloudformation_error": cf_err,
+            "terraform_valid": tf_valid,
+            "terraform_error": tf_err
+        }
+    }
+
+
+# 🔹 Health check (IMPORTANT for Load Balancer)
+@app.get("/")
+def health():
+    return {"status": "running"}
+
+
+# 🔹 CLI MODE (kept from your original)
 if __name__ == "__main__":
     user_input = input("Describe your infrastructure:\n")
 
     output = generate_iac(user_input)
-
-    cf_code, tf_code = split_output(output)
+    cf_code, tf_code, diagram = split_output(output)
 
     save_files(cf_code, tf_code)
 
     print("\n=== CloudFormation ===\n", cf_code)
     print("\n=== Terraform ===\n", tf_code)
+    print("\n=== Diagram ===\n", diagram)
 
-    # 🔥 Run validations automatically
     if cf_code:
-        validate_cloudformation()
+        valid, err = validate_cloudformation()
+        print("\nCF VALID:", valid)
+        if err:
+            print(err)
 
     if tf_code:
-        validate_terraform()
+        valid, err = validate_terraform()
+        print("\nTF VALID:", valid)
+        if err:
+            print(err)
